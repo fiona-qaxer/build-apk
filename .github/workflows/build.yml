@@ -439,8 +439,13 @@ jobs:
         run: |
           sed -i "s|URL_PLACEHOLDER|${{ env.url }}|g" project/app/src/main/java/com/web2apk/app/MainActivity.java
           sed -i "s|<string name=\"app_name\">.*</string>|<string name=\"app_name\">${{ env.app_name }}</string>|g" project/app/src/main/res/values/strings.xml
-          if [ ! -f build-assets/icon.png ] || ! file build-assets/icon.png | grep -q PNG; then
-            echo "⚠️ Icon tidak valid, membuat default..."
+          if [ ! -f build-assets/icon.png ] || ! identify build-assets/icon.png >/dev/null 2>&1; then
+            echo "⚠️ Icon tidak valid atau tidak ditemukan, membuat default..."
+            mkdir -p build-assets
+            convert -size 512x512 xc:blue build-assets/icon.png
+          fi
+          if ! identify build-assets/icon.png >/dev/null 2>&1; then
+            echo "❌ Source icon masih tidak valid setelah default creation!"
             convert -size 512x512 xc:blue build-assets/icon.png
           fi
           mkdir -p project/app/src/main/res/mipmap-hdpi project/app/src/main/res/mipmap-mdpi project/app/src/main/res/mipmap-xhdpi project/app/src/main/res/mipmap-xxhdpi project/app/src/main/res/mipmap-xxxhdpi
@@ -454,6 +459,18 @@ jobs:
           cp project/app/src/main/res/mipmap-xhdpi/ic_launcher.png project/app/src/main/res/mipmap-xhdpi/ic_launcher_round.png
           cp project/app/src/main/res/mipmap-xxhdpi/ic_launcher.png project/app/src/main/res/mipmap-xxhdpi/ic_launcher_round.png
           cp project/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png project/app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.png
+          for dir in mipmap-hdpi mipmap-mdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            if ! identify "project/app/src/main/res/$dir/ic_launcher.png" >/dev/null 2>&1; then
+              echo "⚠️ Icon di $dir tidak valid, regenerate dengan default..."
+              convert -size 192x192 xc:blue "project/app/src/main/res/$dir/ic_launcher.png"
+              cp "project/app/src/main/res/$dir/ic_launcher.png" "project/app/src/main/res/$dir/ic_launcher_round.png"
+            fi
+            if ! identify "project/app/src/main/res/$dir/ic_launcher_round.png" >/dev/null 2>&1; then
+              echo "⚠️ Round icon di $dir tidak valid, regenerate..."
+              cp "project/app/src/main/res/$dir/ic_launcher.png" "project/app/src/main/res/$dir/ic_launcher_round.png"
+            fi
+          done
+          echo "✅ Semua icon Web2APK berhasil divalidasi."
           rm -f project/app/debug.keystore
           keytool -genkey -v -keystore project/app/debug.keystore -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug, O=Android, C=US"
 
@@ -509,18 +526,26 @@ jobs:
           MIPMAP_DIRS="mipmap-hdpi mipmap-mdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi"
           NEEDS_REGEN=false
 
-          # Cek apakah semua file ic_launcher.png ada dan valid
+          # Cek apakah semua file ic_launcher dan ic_launcher_round ada dan valid
           for dir in $MIPMAP_DIRS; do
-            PNG_FILE="android/app/src/main/res/$dir/ic_launcher.png"
-            if [ ! -f "$PNG_FILE" ]; then
-              NEEDS_REGEN=true
-              break
-            fi
-            # Validasi dengan file dan identify
-            if ! file "$PNG_FILE" | grep -q PNG || ! identify "$PNG_FILE" &>/dev/null; then
-              NEEDS_REGEN=true
-              break
-            fi
+            for icon_name in ic_launcher ic_launcher_round; do
+              PNG_FILE="android/app/src/main/res/$dir/${icon_name}.png"
+              WEBP_FILE="android/app/src/main/res/$dir/${icon_name}.webp"
+              if [ -f "$PNG_FILE" ]; then
+                if ! identify "$PNG_FILE" >/dev/null 2>&1; then
+                  NEEDS_REGEN=true
+                  break 2
+                fi
+              elif [ -f "$WEBP_FILE" ]; then
+                if ! identify "$WEBP_FILE" >/dev/null 2>&1; then
+                  NEEDS_REGEN=true
+                  break 2
+                fi
+              else
+                NEEDS_REGEN=true
+                break 2
+              fi
+            done
           done
 
           if [ "$NEEDS_REGEN" = false ]; then
@@ -528,97 +553,82 @@ jobs:
             exit 0
           fi
 
-          echo "⚠️ Icons missing or invalid. Attempting to fix by converting existing files..."
-
-          # Jika semua file ada tapi ada yang tidak valid, coba konversi ulang
-          # Cek apakah semua file ada (meskipun tidak valid)
-          ALL_EXIST=true
-          for dir in $MIPMAP_DIRS; do
-            if [ ! -f "android/app/src/main/res/$dir/ic_launcher.png" ]; then
-              ALL_EXIST=false
-              break
-            fi
-          done
-
-          if [ "$ALL_EXIST" = true ]; then
-            echo "All files exist, trying to convert them to valid PNG..."
-            CONVERT_FAIL=false
-            for dir in $MIPMAP_DIRS; do
-              PNG_FILE="android/app/src/main/res/$dir/ic_launcher.png"
-              # convert will read the actual format and rewrite as PNG
-              if ! convert "$PNG_FILE" "$PNG_FILE" 2>/dev/null; then
-                CONVERT_FAIL=true
-                break
-              fi
-            done
-            if [ "$CONVERT_FAIL" = false ]; then
-              # Also fix round icons
-              for dir in $MIPMAP_DIRS; do
-                ROUND_FILE="android/app/src/main/res/$dir/ic_launcher_round.png"
-                if [ -f "$ROUND_FILE" ]; then
-                  convert "$ROUND_FILE" "$ROUND_FILE" 2>/dev/null || true
-                fi
-              done
-              echo "✅ Icons converted successfully."
-              exit 0
-            else
-              echo "Conversion failed, will regenerate from source."
-            fi
-          fi
-
-          # Jika tidak semua ada atau konversi gagal, regenerasi dari build-assets
-          echo "Regenerating icons from build-assets/icon.png..."
-
-          # Hapus semua file ikon
-          for dir in $MIPMAP_DIRS; do
-            rm -f android/app/src/main/res/$dir/ic_launcher.*
-          done
+          echo "⚠️ Icons missing or invalid. Regenerating from build-assets..."
 
           # Sumber icon
-          if [ -f ../build-assets/icon.png ] && file ../build-assets/icon.png | grep -q PNG; then
+          if [ -f ../build-assets/icon.png ] && identify ../build-assets/icon.png >/dev/null 2>&1; then
             echo "✅ Using icon from build-assets/icon.png"
             ICON_SRC="../build-assets/icon.png"
           else
             echo "⚠️ No valid icon found, creating default blue icon..."
+            mkdir -p ../build-assets
             convert -size 512x512 xc:blue ../build-assets/icon.png
             ICON_SRC="../build-assets/icon.png"
           fi
 
-          for dir in $MIPMAP_DIRS; do
-            mkdir -p android/app/src/main/res/$dir
+          # Hapus semua file ikon yang ada (PNG, WebP, XML) termasuk adaptive icon XML
+          for dir in $MIPMAP_DIRS mipmap-anydpi-v26; do
+            ICON_DIR="android/app/src/main/res/$dir"
+            if [ -d "$ICON_DIR" ]; then
+              rm -f "$ICON_DIR/ic_launcher.png" "$ICON_DIR/ic_launcher.webp" "$ICON_DIR/ic_launcher.xml" \
+                    "$ICON_DIR/ic_launcher_round.png" "$ICON_DIR/ic_launcher_round.webp" "$ICON_DIR/ic_launcher_round.xml" \
+                    2>/dev/null || true
+            fi
           done
 
-          convert $ICON_SRC -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
-          convert $ICON_SRC -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
-          convert $ICON_SRC -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
-          convert $ICON_SRC -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-          convert $ICON_SRC -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-
+          # Generate fresh icons
           for dir in $MIPMAP_DIRS; do
-            cp android/app/src/main/res/$dir/ic_launcher.png android/app/src/main/res/$dir/ic_launcher_round.png
+            mkdir -p "android/app/src/main/res/$dir"
           done
 
-          echo "✅ Icons regenerated successfully."
+          convert "$ICON_SRC" -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+          convert "$ICON_SRC" -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+          convert "$ICON_SRC" -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          convert "$ICON_SRC" -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          convert "$ICON_SRC" -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
-      - name: Fix Flutter Android configuration (compileSdk 36 & signing)
+          for dir in $MIPMAP_DIRS; do
+            cp "android/app/src/main/res/$dir/ic_launcher.png" "android/app/src/main/res/$dir/ic_launcher_round.png"
+          done
+
+          # Verifikasi semua icon yang di-generate
+          VERIFY_OK=true
+          for dir in $MIPMAP_DIRS; do
+            for icon_name in ic_launcher ic_launcher_round; do
+              PNG_FILE="android/app/src/main/res/$dir/${icon_name}.png"
+              if ! identify "$PNG_FILE" >/dev/null 2>&1; then
+                echo "❌ Generated icon $PNG_FILE is invalid!"
+                VERIFY_OK=false
+              fi
+            done
+          done
+
+          if [ "$VERIFY_OK" = true ]; then
+            echo "✅ Icons regenerated and verified successfully."
+          else
+            echo "❌ Some icons failed to generate properly!"
+            exit 1
+          fi
+
+      - name: Fix Flutter Android configuration (compileSdk 35 & signing)
         if: env.type == 'flutter'
         run: |
           cd flutter-project/android/app
           # Salin keystore
           cp ../../../release.keystore .
 
-          # Perbaiki compileSdk dan targetSdk ke 36
+          # Perbaiki compileSdk dan targetSdk ke 35
           if [ -f build.gradle ]; then
-            sed -i 's/compileSdk [0-9]*/compileSdk 36/g' build.gradle
-            sed -i 's/targetSdk [0-9]*/targetSdk 36/g' build.gradle
+            sed -i 's/compileSdk [0-9]*/compileSdk 35/g' build.gradle
+            sed -i 's/targetSdk [0-9]*/targetSdk 35/g' build.gradle
             # Signing config
             sed -i 's|storeFile file(".*")|storeFile file("release.keystore")|g' build.gradle
             sed -i 's|storePassword ".*"|storePassword "password"|g' build.gradle
             sed -i 's|keyAlias ".*"|keyAlias "release"|g' build.gradle
             sed -i 's|keyPassword ".*"|keyPassword "password"|g' build.gradle
           elif [ -f build.gradle.kts ]; then
-            sed -i 's/compileSdk = [0-9]*/compileSdk = 36/g' build.gradle.kts
-            sed -i 's/targetSdk = [0-9]*/targetSdk = 36/g' build.gradle.kts
+            sed -i 's/compileSdk = [0-9]*/compileSdk = 35/g' build.gradle.kts
+            sed -i 's/targetSdk = [0-9]*/targetSdk = 35/g' build.gradle.kts
             sed -i 's|storeFile = file(".*")|storeFile = file("release.keystore")|g' build.gradle.kts
             sed -i 's|storeFile.set(file(".*"))|storeFile.set(file("release.keystore"))|g' build.gradle.kts
             sed -i 's|storePassword = ".*"|storePassword = "password"|g' build.gradle.kts
